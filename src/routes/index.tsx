@@ -81,7 +81,7 @@ function Home() {
               </div>
               <div>
                 <Title level={3} className="!text-white !mb-0 !text-2xl font-semibold">
-                  FileSync Pro
+                  FileSync
                 </Title>
                 <Text className="text-slate-400 text-sm">Secure • Fast • Reliable</Text>
               </div>
@@ -376,7 +376,7 @@ function Home() {
 
         <div className="text-center mt-16 pt-8 border-t border-slate-700">
           <Text className="text-slate-500">
-            FileSync Pro • Secure file sharing without the cloud • Built for privacy
+            FileSync • Secure file sharing without the cloud • Built for privacy
           </Text>
         </div>
       </div>
