@@ -1,234 +1,500 @@
-import { useState, useRef } from "react";
-import Peer, { DataConnection } from "peerjs";
-import toast from "react-hot-toast";
+import { useState, useRef, useEffect, useCallback } from 'react';
+import Peer, { type DataConnection } from 'peerjs';
+import toast from 'react-hot-toast';
+import confetti from 'canvas-confetti';
+import {
+  registerDeviceServerFn,
+  getNearbyDevicesServerFn,
+  getDeviceByCodeServerFn,
+  unregisterDeviceServerFn,
+  type DiscoveredDevice,
+  type DeviceRole,
+} from '../utils/discoveryServer';
+import {
+  getDefaultDeviceName, getDeviceType, getOperatingSystem,
+  getBrowserName, saveDeviceName,
+} from '../utils/device';
 
-type FileStatus = 'receiving' | 'done' | 'cancelled' | 'sending';
-type FileEntry = { name: string, url: string | null, progress: number, status: FileStatus };
+export type TransferStatus = 'queued' | 'sending' | 'receiving' | 'completed' | 'cancelled' | 'error';
 
-type FileChunkData = {
-    chunk: BlobPart;
-    isLast: boolean;
-    mimeType?: string;
-    fileName?: string;
-    progress?: number;
-    type?: string;
-};
+export interface TransferItem {
+  id: string;
+  name: string;
+  size: number;
+  mimeType: string;
+  direction: 'upload' | 'download';
+  status: TransferStatus;
+  progress: number;
+  bytesTransferred: number;
+  speed: number;
+  eta: number;
+  url?: string;
+  error?: string;
+  startedAt: number;
+  completedAt?: number;
+}
+
+const CHUNK_SIZE = 64 * 1024;
+const MAX_BUFFERED_AMOUNT = 512 * 1024;
 
 export function useFileShare() {
-    const [myId, setMyId] = useState("");
-    const [connectedDevice, setConnectedDevice] = useState("");
-    const [files, setFiles] = useState<FileEntry[]>([]);
-    const [sendingFiles, setSendingFiles] = useState<FileEntry[]>([]);
+  const [myId, setMyId]                           = useState('');
+  const [myCode, setMyCode]                       = useState('');
+  const [deviceName, setDeviceNameState]          = useState('');
+  const [currentRoom]                             = useState('default');
+  const [role, setRole]                           = useState<DeviceRole>('idle');
+  const [connectionStatus, setConnectionStatus]   = useState<
+    'idle' | 'initializing' | 'connecting' | 'connected' | 'disconnected'
+  >('initializing');
+  const [connectedPeerId, setConnectedPeerId]     = useState('');
+  const [connectedPeerName, setConnectedPeerName] = useState('');
+  const [nearbyDevices, setNearbyDevices]         = useState<DiscoveredDevice[]>([]);
+  const [activeTransfers, setActiveTransfers]     = useState<TransferItem[]>([]);
+  const [transferHistory, setTransferHistory]     = useState<TransferItem[]>([]);
+  const [autoDownload, setAutoDownload]           = useState(false);
 
-    const peerRef = useRef<Peer | null>(null);
-    const connectionRef = useRef<DataConnection | null>(null);
-    const fileChunksRef = useRef<Record<string, BlobPart[]>>({});
-    const activeTransfersRef = useRef<Record<string, { cancelled: boolean }>>({});
+  // ── Refs (never stale in callbacks) ──────────────────────────────────────
+  const roleRef              = useRef<DeviceRole>('idle');
+  const peerRef              = useRef<Peer | null>(null);
+  const connectionRef        = useRef<DataConnection | null>(null);
+  const broadcastChannelRef  = useRef<BroadcastChannel | null>(null);
+  const deviceNameRef        = useRef('');
+  const autoDownloadRef      = useRef(true);
+  const activeTransfersRef   = useRef<Record<string, { cancelled: boolean }>>({});
+  const receivingFilesRef    = useRef<Record<string, {
+    meta: { id: string; name: string; size: number; mimeType: string };
+    chunks: BlobPart[];
+    receivedBytes: number;
+    lastUpdate: number;
+    lastBytes: number;
+  }>>({});
 
-    const generateConnectionId = () => {
-        if (!peerRef.current) {
-            const peer = new Peer();
-            peer.on("open", (id) => setMyId(id));
-            peer.on("connection", (conn) => {
-                connectionRef.current = conn;
-                conn.on("open", () => {
-                    setConnectedDevice(conn.peer);
-                    conn.on("data", acceptFile);
-                });
-            });
-            peerRef.current = peer;
+  // Keep refs in sync
+  useEffect(() => { roleRef.current = role; }, [role]);
+  useEffect(() => { deviceNameRef.current = deviceName; }, [deviceName]);
+  useEffect(() => { autoDownloadRef.current = autoDownload; }, [autoDownload]);
+
+  // ── Init: 6-digit code + device name ──────────────────────────────────────
+  useEffect(() => {
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    setMyCode(code);
+    const name = getDefaultDeviceName();
+    setDeviceNameState(name);
+    deviceNameRef.current = name;
+  }, []);
+
+  // ── Confetti ──────────────────────────────────────────────────────────────
+  const triggerConfetti = useCallback(() => {
+    try {
+      confetti({ particleCount: 50, spread: 60, origin: { y: 0.7 }, colors: ['#2563eb', '#10b981', '#6366f1'] });
+    } catch {}
+  }, []);
+
+  // ── Update device name ────────────────────────────────────────────────────
+  const updateDeviceName = useCallback((name: string) => {
+    const trimmed = name.trim() || 'My Device';
+    setDeviceNameState(trimmed);
+    deviceNameRef.current = trimmed;
+    saveDeviceName(trimmed);
+  }, []);
+
+  // ── Handle incoming data ───────────────────────────────────────────────────
+  const handleIncomingData = useCallback((data: any) => {
+    if (!data || typeof data !== 'object') return;
+
+    // Handshake
+    if (data.type === 'peer_handshake') {
+      if (data.name) {
+        setConnectedPeerName(data.name);
+        toast.success(`Paired with ${data.name}!`, { id: 'peer-connect' });
+      }
+      return;
+    }
+
+    // Cancel
+    if (data.type === 'file_cancel') {
+      const { id } = data;
+      if (id) {
+        delete receivingFilesRef.current[id];
+        setActiveTransfers(prev => prev.map(t => t.id === id ? { ...t, status: 'cancelled' as TransferStatus } : t));
+        toast.error('Transfer cancelled by sender');
+      }
+      return;
+    }
+
+    // File meta
+    if (data.type === 'file_meta') {
+      const { id, name, size, mimeType } = data;
+      receivingFilesRef.current[id] = {
+        meta: { id, name, size, mimeType },
+        chunks: [],
+        receivedBytes: 0,
+        lastUpdate: Date.now(),
+        lastBytes: 0,
+      };
+      setActiveTransfers(prev => [
+        { id, name, size, mimeType: mimeType || 'application/octet-stream', direction: 'download', status: 'receiving', progress: 0, bytesTransferred: 0, speed: 0, eta: 0, startedAt: Date.now() },
+        ...prev.filter(t => t.id !== id),
+      ]);
+      toast(`Receiving "${name}"…`, { icon: '📥' });
+      return;
+    }
+
+    // Chunk
+    if (data.type === 'file_chunk') {
+      const { id, index, data: chunk } = data;
+      const entry = receivingFilesRef.current[id];
+      if (!entry) return;
+
+      entry.chunks[index] = chunk;
+      entry.receivedBytes += chunk.byteLength || 0;
+
+      const now = Date.now();
+      const elapsed = (now - entry.lastUpdate) / 1000;
+      if (elapsed >= 0.25 || entry.receivedBytes >= entry.meta.size) {
+        const speed = elapsed > 0 ? (entry.receivedBytes - entry.lastBytes) / elapsed : 0;
+        const eta = speed > 0 ? Math.max(0, entry.meta.size - entry.receivedBytes) / speed : 0;
+        entry.lastUpdate = now;
+        entry.lastBytes = entry.receivedBytes;
+        const progress = Math.min(100, Math.round(entry.receivedBytes / entry.meta.size * 100));
+        setActiveTransfers(prev => prev.map(t => t.id === id ? { ...t, progress, bytesTransferred: entry.receivedBytes, speed, eta } : t));
+      }
+      return;
+    }
+
+    // Complete
+    if (data.type === 'file_complete') {
+      const { id } = data;
+      const entry = receivingFilesRef.current[id];
+      if (!entry) return;
+
+      const blob = new Blob(entry.chunks, { type: entry.meta.mimeType });
+      const url  = URL.createObjectURL(blob);
+      const now  = Date.now();
+
+      if (autoDownloadRef.current) {
+        const a = document.createElement('a');
+        a.href = url; a.download = entry.meta.name;
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      }
+
+      triggerConfetti();
+      toast.success(`"${entry.meta.name}" received!`, { icon: '🎉' });
+
+      const done: TransferItem = {
+        id, name: entry.meta.name, size: entry.meta.size, mimeType: entry.meta.mimeType,
+        direction: 'download', status: 'completed', progress: 100,
+        bytesTransferred: entry.meta.size, speed: 0, eta: 0, url,
+        startedAt: now - 1000, completedAt: now,
+      };
+
+      setActiveTransfers(prev => prev.filter(t => t.id !== id));
+      setTransferHistory(prev => [done, ...prev]);
+      delete receivingFilesRef.current[id];
+    }
+  }, [triggerConfetti]);
+
+  // ── Setup a DataConnection ─────────────────────────────────────────────────
+  const setupConnection = useCallback((conn: DataConnection) => {
+    if (connectionRef.current && connectionRef.current !== conn) {
+      try { connectionRef.current.close(); } catch {}
+    }
+    connectionRef.current = conn;
+    setConnectionStatus('connecting');
+
+    let timeoutId: any;
+
+    const onOpen = () => {
+      clearTimeout(timeoutId);
+      setConnectedPeerId(conn.peer);
+      setConnectionStatus('connected');
+      // Send our name to the other side
+      try {
+        conn.send({ type: 'peer_handshake', name: deviceNameRef.current || getDefaultDeviceName() });
+      } catch {}
+      toast.success('Connection established!', { id: 'peer-connect' });
+    };
+
+    conn.on('open', onOpen);
+    // Guard: if already open (rare but can happen on re-connection)
+    if ((conn as any).open === true) onOpen();
+    else {
+      timeoutId = setTimeout(() => {
+        if (connectionStatus !== 'connected') {
+          toast.error('Connection timed out. Please try again.');
+          try { conn.close(); } catch {}
+          setConnectionStatus('idle');
+          connectionRef.current = null;
+        }
+      }, 10000);
+    }
+
+    conn.on('data', handleIncomingData);
+
+    conn.on('close', () => {
+      clearTimeout(timeoutId);
+      setConnectedPeerId('');
+      setConnectedPeerName('');
+      setConnectionStatus('idle');
+      connectionRef.current = null;
+      toast('Session ended', { icon: '🔌', id: 'peer-disconnect' });
+    });
+
+    conn.on('error', err => {
+      clearTimeout(timeoutId);
+      console.error('DataConnection error:', err);
+      setConnectionStatus('idle');
+      toast.error('Connection error. Please try again.');
+    });
+  }, [handleIncomingData, connectionStatus]);
+
+  // ── PeerJS init ───────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const peer = new Peer({
+      debug: 0,
+      config: {
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun1.l.google.com:19302' },
+          { urls: 'stun:stun2.l.google.com:19302' },
+        ],
+      },
+    });
+
+    peerRef.current = peer;
+
+    peer.on('open', id => {
+      setMyId(id);
+      setConnectionStatus('idle');
+
+      // Auto-connect from URL ?connect=<peerId>
+      const params = new URLSearchParams(window.location.search);
+      const targetPeer = params.get('connect');
+      if (targetPeer && targetPeer !== id) {
+        setRole('sender');
+        setTimeout(() => {
+          const conn = peer.connect(targetPeer);
+          setupConnection(conn);
+        }, 500);
+      }
+    });
+
+    peer.on('connection', conn => setupConnection(conn));
+
+    peer.on('error', err => {
+      console.warn('PeerJS error:', (err as any).type, err);
+      if ((err as any).type === 'peer-unavailable') {
+        toast.error('Device not found. Make sure the receiver is waiting.');
+        setConnectionStatus('idle');
+      } else if ((err as any).type === 'network' || (err as any).type === 'server-error') {
+        toast.error('Network error. Check your connection.');
+        setConnectionStatus('idle');
+      }
+    });
+
+    // BroadcastChannel (same-machine / same-tab multi-window discovery)
+    try {
+      const bc = new BroadcastChannel('filesync_mesh_v2');
+      broadcastChannelRef.current = bc;
+      bc.onmessage = e => {
+        const msg = e.data;
+        if (!msg || !msg.id) return;
+        if (msg.type === 'announce') {
+          if (roleRef.current === 'sender' && msg.role !== 'receiver') return;
+          if (roleRef.current === 'receiver' && msg.role !== 'sender') return;
+          
+          setNearbyDevices(prev => {
+            const filtered = prev.filter(d => d.id !== msg.id);
+            return [...filtered, { id: msg.id, code: msg.code, name: msg.name, deviceType: msg.deviceType, role: msg.role, room: msg.room, os: msg.os, browser: msg.browser, lastSeen: Date.now() }];
+          });
+        }
+      };
+    } catch {}
+
+    return () => {
+      broadcastChannelRef.current?.close();
+      peer.destroy();
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ── Heartbeat + server discovery (every 3s) ───────────────────────────────
+  useEffect(() => {
+    if (!myId) return;
+    let alive = true;
+
+    const sync = async () => {
+      try {
+        const name = deviceNameRef.current || getDefaultDeviceName();
+        if (role !== 'idle') {
+          await registerDeviceServerFn({ data: { id: myId, code: myCode, name, deviceType: getDeviceType(), role, room: currentRoom, os: getOperatingSystem(), browser: getBrowserName() } });
+          broadcastChannelRef.current?.postMessage({ type: 'announce', id: myId, code: myCode, name, deviceType: getDeviceType(), role, room: currentRoom, os: getOperatingSystem(), browser: getBrowserName() });
         } else {
-            toast.error("Id already Generated");
+          await unregisterDeviceServerFn({ data: { id: myId } });
         }
+        const targetRole = role === 'sender' ? 'receiver' : (role === 'receiver' ? 'sender' : undefined);
+        const res = await getNearbyDevicesServerFn({ data: { room: currentRoom, excludeId: myId, roleFilter: targetRole } });
+        if (alive && res?.devices) setNearbyDevices(res.devices);
+      } catch {}
     };
 
-    const submit = (values: { connectionId: string }) => {
-        if (peerRef.current) {
-            let conn = connectionRef.current;
-            if (!conn || conn.open === false) {
-                try {
-                    conn = peerRef.current.connect(values.connectionId);
-                    connectionRef.current = conn;
-                    conn.on("open", () => {
-                        if (conn) {
-                            setConnectedDevice(conn.peer);
-                            conn.on("data", acceptFile);
-                        }
-                    });
-                } catch (error) {
-                    console.error("Failed to connect:", error);
-                }
-            } else {
-                toast.error("Already connected.");
-            }
-        } else {
-            toast.error("Peer not initialized.");
-        }
+    sync();
+    const iv = setInterval(sync, 3000);
+    const onUnload = () => { try { unregisterDeviceServerFn({ data: { id: myId } }); } catch {} };
+    window.addEventListener('beforeunload', onUnload);
+
+    return () => { 
+      alive = false; 
+      clearInterval(iv); 
+      window.removeEventListener('beforeunload', onUnload);
+      try { unregisterDeviceServerFn({ data: { id: myId } }); } catch {}
     };
+  }, [myId, myCode, role, currentRoom]);
 
-    const sendFile = (fileObj: any) => {
-        if (!connectionRef.current || !connectionRef.current.open) {
-            toast.error("No device connected.");
-            return;
+  // ── Connect by Peer ID ────────────────────────────────────────────────────
+  const connectToPeer = useCallback((targetId: string, nameHint?: string) => {
+    if (!peerRef.current) { toast.error('Still initializing…'); return; }
+    if (targetId === myId) { toast.error('Cannot connect to yourself.'); return; }
+    if (connectionRef.current?.open) { toast('Already connected.'); return; }
+
+    setConnectionStatus('connecting');
+    if (nameHint) setConnectedPeerName(nameHint);
+
+    try {
+      const conn = peerRef.current.connect(targetId);
+      setupConnection(conn);
+    } catch {
+      setConnectionStatus('idle');
+      toast.error('Failed to initiate connection.');
+    }
+  }, [myId, setupConnection]);
+
+  // ── Connect by 6-digit code ───────────────────────────────────────────────
+  const connectByCode = useCallback(async (code: string) => {
+    const clean = code.replace(/\s+/g, '').trim();
+    if (!clean) { toast.error('Please enter a code'); return; }
+
+    // Check local devices first
+    const local = nearbyDevices.find(d => d.code?.replace(/\s+/g, '') === clean);
+    if (local) { connectToPeer(local.id, local.name); return; }
+
+    setConnectionStatus('connecting');
+    try {
+      const res = await getDeviceByCodeServerFn({ data: { code: clean } });
+      if (res?.found && res.device) {
+        connectToPeer(res.device.id, res.device.name);
+      } else {
+        setConnectionStatus('idle');
+        toast.error('No device found with that code.');
+      }
+    } catch {
+      setConnectionStatus('idle');
+      toast.error('Could not verify code.');
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nearbyDevices, connectToPeer]);
+
+  // ── Disconnect ────────────────────────────────────────────────────────────
+  const disconnect = useCallback(() => {
+    try { connectionRef.current?.close(); } catch {}
+    connectionRef.current = null;
+    setConnectedPeerId('');
+    setConnectedPeerName('');
+    setConnectionStatus('idle');
+    toast('Disconnected', { id: 'peer-disconnect' });
+  }, []);
+
+  // ── Send a file (streaming chunks) ───────────────────────────────────────
+  const sendSingleFile = useCallback(async (file: File) => {
+    const conn = connectionRef.current;
+    if (!conn?.open) { toast.error('No active connection.'); return; }
+
+    const fileId   = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const mimeType = file.type || 'application/octet-stream';
+    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+
+    activeTransfersRef.current[fileId] = { cancelled: false };
+    setActiveTransfers(prev => [
+      { id: fileId, name: file.name, size: file.size, mimeType, direction: 'upload', status: 'sending', progress: 0, bytesTransferred: 0, speed: 0, eta: 0, startedAt: Date.now() },
+      ...prev,
+    ]);
+
+    conn.send({ type: 'file_meta', id: fileId, name: file.name, size: file.size, mimeType, totalChunks });
+
+    const dc = (conn as any).dataChannel as RTCDataChannel | undefined;
+    let offset = 0, chunkIdx = 0, lastTime = Date.now(), lastBytes = 0;
+
+    const waitDrain = () => new Promise<void>(resolve => {
+      if (!dc || dc.bufferedAmount <= MAX_BUFFERED_AMOUNT) { resolve(); return; }
+      dc.bufferedAmountLowThreshold = 128 * 1024;
+      const h = () => { dc.removeEventListener('bufferedamountlow', h); resolve(); };
+      dc.addEventListener('bufferedamountlow', h);
+      setTimeout(() => { dc?.removeEventListener('bufferedamountlow', h); resolve(); }, 50);
+    });
+
+    try {
+      while (offset < file.size) {
+        if (activeTransfersRef.current[fileId]?.cancelled) {
+          conn.send({ type: 'file_cancel', id: fileId });
+          return;
         }
-        const selectedFile = fileObj.originFileObj;
-        if (!selectedFile) return;
+        if (dc && dc.bufferedAmount > MAX_BUFFERED_AMOUNT) await waitDrain();
 
-        const chunkSize = 1024 * 1024;
-        const reader = new FileReader();
-        let offset = 0;
+        const end = Math.min(offset + CHUNK_SIZE, file.size);
+        const buf = await file.slice(offset, end).arrayBuffer();
+        conn.send({ type: 'file_chunk', id: fileId, index: chunkIdx, data: buf });
+        offset = end; chunkIdx++;
 
-        setSendingFiles((prev) => {
-            const exists = prev.find((f) => f.name === selectedFile.name);
-            if (exists) {
-                return prev.map((f) =>
-                    f.name === selectedFile.name ? { ...f, progress: 0, status: "sending" } : f
-                );
-            } else {
-                return [
-                    ...prev,
-                    { name: selectedFile.name, url: null, progress: 0, status: "sending" }
-                ];
-            }
-        });
-
-        reader.onload = (e) => {
-            const arrayBuffer = e.target?.result as ArrayBuffer;
-            if (!arrayBuffer) return;
-
-            const totalSize = selectedFile.size;
-            const mimeType = selectedFile.type;
-            const fileName = selectedFile.name;
-
-            activeTransfersRef.current[fileName] = { cancelled: false };
-
-            function sendChunk() {
-                if (activeTransfersRef.current[fileName]?.cancelled) return;
-
-                const end = Math.min(offset + chunkSize, totalSize);
-                const chunk = arrayBuffer.slice(offset, end);
-                const isLast = end >= totalSize;
-
-                const progress = Math.round((end / totalSize) * 100);
-
-                connectionRef.current?.send({
-                    chunk,
-                    isLast,
-                    mimeType,
-                    fileName,
-                    progress,
-                });
-                console.log("sendingfile", progress)
-
-                offset = end;
-
-                setSendingFiles((prev) =>
-                    prev.map((f) => (f.name === fileName ? { ...f, progress } : f))
-                );
-
-                if (!isLast) {
-                    setTimeout(sendChunk, 0);
-                } else {
-                    setSendingFiles((prev) =>
-                        prev.map((f) =>
-                            f.name === fileName ? { ...f, progress: 100, status: "done" } : f
-                        )
-                    );
-                    delete activeTransfersRef.current[fileName];
-                    toast.success(`${fileName} sent!`);
-                }
-            }
-
-            sendChunk();
-        };
-
-        reader.readAsArrayBuffer(selectedFile);
-    };
-
-    const cancelSendingFile = (fileName: string) => {
-        if (activeTransfersRef.current[fileName]) {
-            activeTransfersRef.current[fileName].cancelled = true;
-            connectionRef.current?.send({ type: "cancel", fileName });
-            setSendingFiles((prev) =>
-                prev.map((f) => (f.name === fileName ? { ...f, status: "cancelled" } : f))
-            );
-            toast.error(`${fileName} cancelled!`);
+        const now = Date.now();
+        const elapsed = (now - lastTime) / 1000;
+        if (elapsed >= 0.25 || offset >= file.size) {
+          const speed = elapsed > 0 ? (offset - lastBytes) / elapsed : 0;
+          const eta = speed > 0 ? (file.size - offset) / speed : 0;
+          const progress = Math.min(100, Math.round(offset / file.size * 100));
+          lastTime = now; lastBytes = offset;
+          setActiveTransfers(prev => prev.map(t => t.id === fileId ? { ...t, progress, bytesTransferred: offset, speed, eta } : t));
         }
-    };
+      }
 
-    const acceptFile = (data: unknown) => {
-        const fileData = data as FileChunkData;
+      conn.send({ type: 'file_complete', id: fileId });
+      triggerConfetti();
+      toast.success(`"${file.name}" sent!`, { icon: '🚀' });
 
-        if (fileData?.type === "cancel") {
-            const { fileName } = fileData;
-            if (fileName) {
-                delete fileChunksRef.current[fileName];
-                setFiles((prev) =>
-                    prev.map((f) => (f.name === fileName ? { ...f, status: "cancelled" } : f))
-                );
-                toast.error(`${fileName} transfer cancelled by sender.`);
-            }
-            return;
-        }
+      const done: TransferItem = {
+        id: fileId, name: file.name, size: file.size, mimeType, direction: 'upload',
+        status: 'completed', progress: 100, bytesTransferred: file.size,
+        speed: 0, eta: 0, startedAt: Date.now() - 1000, completedAt: Date.now(),
+      };
+      setActiveTransfers(prev => prev.filter(t => t.id !== fileId));
+      setTransferHistory(prev => [done, ...prev]);
+      delete activeTransfersRef.current[fileId];
+    } catch (err: any) {
+      setActiveTransfers(prev => prev.map(t => t.id === fileId ? { ...t, status: 'error', error: err?.message } : t));
+      toast.error(`Failed to send "${file.name}"`);
+    }
+  }, [triggerConfetti]);
 
-        if (typeof data === "object" && data !== null && "chunk" in data && "isLast" in data) {
-            const { fileName = "download", mimeType = "application/octet-stream", progress = 0 } = fileData;
+  const sendFiles = useCallback(async (files: File[]) => {
+    for (const f of files) await sendSingleFile(f);
+  }, [sendSingleFile]);
 
-            if (!fileChunksRef.current[fileName]) {
-                fileChunksRef.current[fileName] = [];
-                setFiles((prev) => {
-                    const exists = prev.find((f) => f.name === fileName);
-                    if (exists) {
-                        return prev.map((f) =>
-                            f.name === fileName ? { ...f, url: null, progress: 0, status: "receiving" } : f
-                        );
-                    } else {
-                        return [...prev, { name: fileName, url: null, progress: 0, status: "receiving" }];
-                    }
-                });
-            }
+  const cancelTransfer = useCallback((id: string) => {
+    if (activeTransfersRef.current[id]) activeTransfersRef.current[id].cancelled = true;
+    connectionRef.current?.send({ type: 'file_cancel', id });
+    setActiveTransfers(prev => prev.map(t => t.id === id ? { ...t, status: 'cancelled' as TransferStatus } : t));
+    toast('Transfer cancelled');
+  }, []);
 
-            fileChunksRef.current[fileName].push(fileData.chunk);
-            console.log("recievefile", progress)
-            setFiles((prev) =>
-                prev.map((f) =>
-                    f.name === fileName
-                        ? {
-                            ...f,
+  const clearHistory = useCallback(() => setTransferHistory([]), []);
 
-                            progress: fileData.isLast ? 100 : progress,
-                            status: fileData.isLast ? "done" : "receiving",
-                        }
-                        : f
-                )
-            );
-
-            if (fileData.isLast) {
-                const blob = new Blob(fileChunksRef.current[fileName], { type: mimeType });
-                const url = URL.createObjectURL(blob);
-
-                setFiles((prev) =>
-                    prev.map((f) =>
-                        f.name === fileName ? { ...f, url, progress: 100, status: "done" } : f
-                    )
-                );
-
-                fileChunksRef.current[fileName] = [];
-                toast.success(`${fileName} received.`);
-            }
-        } else {
-            toast.error("Not a File.");
-        }
-    };
-
-    return {
-        myId,
-        connectedDevice,
-        files,
-        sendingFiles,
-        generateConnectionId,
-        submit,
-        sendFile,
-        cancelSendingFile,
-    };
+  return {
+    myId, myCode, deviceName, role, connectionStatus,
+    connectedPeerId, connectedPeerName,
+    nearbyDevices, activeTransfers, transferHistory, autoDownload,
+    setRole, updateDeviceName,
+    connectToPeer, connectByCode, disconnect,
+    sendFiles, sendSingleFile, cancelTransfer, clearHistory, setAutoDownload,
+  };
 }

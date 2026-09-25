@@ -4,19 +4,93 @@
 
 @layer base {
   html {
-    color-scheme: light dark;
+    scroll-behavior: smooth;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    @apply bg-white dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100;
+    font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
   }
 
   * {
-    @apply border-gray-200 dark:border-gray-800;
+    @apply border-zinc-200 dark:border-zinc-800;
   }
 
-  html,
-  body {
-    @apply text-gray-900 bg-gray-50 dark:bg-gray-950 dark:text-gray-200;
-  }
+  ::-webkit-scrollbar { width: 5px; height: 5px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { @apply bg-zinc-300 dark:bg-zinc-700 rounded-full; }
+  ::-webkit-scrollbar-thumb:hover { @apply bg-zinc-400 dark:bg-zinc-600; }
+}
 
-  .using-mouse * {
-    outline: none !important;
-  }
+/* ───────────────────────────────────────────────
+   Radar animations
+   ─────────────────────────────────────────────── */
+@keyframes radarSweep {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+@keyframes radarRing {
+  0%   { transform: scale(0.4); opacity: 0.8; }
+  100% { transform: scale(1.8); opacity: 0; }
+}
+
+@keyframes radarPing {
+  0%, 100% { transform: scale(1);   opacity: 0.5; }
+  50%       { transform: scale(1.05); opacity: 0.15; }
+}
+
+@keyframes shimmer {
+  0%   { background-position: -200% 0; }
+  100% { background-position:  200% 0; }
+}
+
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.animate-radar-sweep { animation: radarSweep 3s linear infinite; }
+.animate-radar-ring  { animation: radarRing  2.5s ease-out infinite; }
+.animate-radar-ping  { animation: radarPing  2.5s ease-in-out infinite; }
+.animate-fade-up     { animation: fadeUp 0.4s ease both; }
+.animate-shimmer {
+  background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.06) 50%, transparent 100%);
+  background-size: 200% 100%;
+  animation: shimmer 2s infinite;
+}
+
+/* Radar sweep gradient cone */
+.radar-cone {
+  background: conic-gradient(
+    from 0deg,
+    transparent 0deg,
+    transparent 260deg,
+    rgba(59,130,246,0.12) 300deg,
+    rgba(59,130,246,0.45) 360deg
+  );
+}
+
+.dark .radar-cone {
+  background: conic-gradient(
+    from 0deg,
+    transparent 0deg,
+    transparent 260deg,
+    rgba(96,165,250,0.10) 300deg,
+    rgba(96,165,250,0.35) 360deg
+  );
+}
+
+/* Glass card */
+.glass {
+  @apply bg-white/70 dark:bg-zinc-900/70 backdrop-blur-xl;
+  @apply border border-white/60 dark:border-zinc-700/60;
+  @apply shadow-lg shadow-zinc-200/30 dark:shadow-black/30;
+}
+
+/* Gradient text */
+.gradient-text {
+  @apply bg-gradient-to-r from-blue-600 to-violet-600 dark:from-blue-400 dark:to-violet-400 bg-clip-text text-transparent;
 }
