@@ -57,6 +57,8 @@ export function useFileShare() {
   const roleRef              = useRef<DeviceRole>('idle');
   const peerRef              = useRef<Peer | null>(null);
   const connectionRef        = useRef<DataConnection | null>(null);
+  const connectingTargetRef  = useRef<string | null>(null);
+  const connectionTimeoutRef = useRef<any>(null);
   const broadcastChannelRef  = useRef<BroadcastChannel | null>(null);
   const deviceNameRef        = useRef('');
   const autoDownloadRef      = useRef(true);
@@ -196,16 +198,24 @@ export function useFileShare() {
 
   // ── Setup a DataConnection ─────────────────────────────────────────────────
   const setupConnection = useCallback((conn: DataConnection) => {
+    if (connectionTimeoutRef.current) {
+      clearTimeout(connectionTimeoutRef.current);
+      connectionTimeoutRef.current = null;
+    }
+
     if (connectionRef.current && connectionRef.current !== conn) {
       try { connectionRef.current.close(); } catch {}
     }
     connectionRef.current = conn;
     setConnectionStatus('connecting');
 
-    let timeoutId: any;
-
     const onOpen = () => {
-      clearTimeout(timeoutId);
+      if (connectionTimeoutRef.current) {
+        clearTimeout(connectionTimeoutRef.current);
+        connectionTimeoutRef.current = null;
+      }
+      if (connectionRef.current !== conn) return;
+      connectingTargetRef.current = null;
       setConnectedPeerId(conn.peer);
       setConnectionStatus('connected');
       // Send our name to the other side
@@ -219,11 +229,12 @@ export function useFileShare() {
     // Guard: if already open (rare but can happen on re-connection)
     if ((conn as any).open === true) onOpen();
     else {
-      timeoutId = setTimeout(() => {
-        if (connectionStatus !== 'connected') {
-          toast.error('Connection timed out. Please try again.');
+      connectionTimeoutRef.current = setTimeout(() => {
+        if (connectionRef.current === conn && connectionStatus !== 'connected') {
+          toast.error('Connection timed out. Please try again.', { id: 'peer-error' });
           try { conn.close(); } catch {}
           setConnectionStatus('idle');
+          connectingTargetRef.current = null;
           connectionRef.current = null;
         }
       }, 10000);
@@ -232,19 +243,29 @@ export function useFileShare() {
     conn.on('data', handleIncomingData);
 
     conn.on('close', () => {
-      clearTimeout(timeoutId);
+      if (connectionRef.current !== conn) return;
+      if (connectionTimeoutRef.current) {
+        clearTimeout(connectionTimeoutRef.current);
+        connectionTimeoutRef.current = null;
+      }
       setConnectedPeerId('');
       setConnectedPeerName('');
       setConnectionStatus('idle');
+      connectingTargetRef.current = null;
       connectionRef.current = null;
       toast('Session ended', { icon: '🔌', id: 'peer-disconnect' });
     });
 
     conn.on('error', err => {
-      clearTimeout(timeoutId);
+      if (connectionRef.current !== conn) return;
+      if (connectionTimeoutRef.current) {
+        clearTimeout(connectionTimeoutRef.current);
+        connectionTimeoutRef.current = null;
+      }
       console.error('DataConnection error:', err);
       setConnectionStatus('idle');
-      toast.error('Connection error. Please try again.');
+      connectingTargetRef.current = null;
+      toast.error('Connection error. Please try again.', { id: 'peer-error' });
     });
   }, [handleIncomingData, connectionStatus]);
 
@@ -273,10 +294,15 @@ export function useFileShare() {
       const params = new URLSearchParams(window.location.search);
       const targetPeer = params.get('connect');
       if (targetPeer && targetPeer !== id) {
+        try {
+          const newUrl = new URL(window.location.href);
+          newUrl.searchParams.delete('connect');
+          window.history.replaceState({}, document.title, newUrl.pathname + (newUrl.search ? newUrl.search : ''));
+        } catch {}
+
         setRole('sender');
         setTimeout(() => {
-          const conn = peer.connect(targetPeer);
-          setupConnection(conn);
+          connectToPeer(targetPeer);
         }, 500);
       }
     });
@@ -286,10 +312,10 @@ export function useFileShare() {
     peer.on('error', err => {
       console.warn('PeerJS error:', (err as any).type, err);
       if ((err as any).type === 'peer-unavailable') {
-        toast.error('Device not found. Make sure the receiver is waiting.');
+        toast.error('Device not found. Make sure the receiver is waiting.', { id: 'peer-error' });
         setConnectionStatus('idle');
       } else if ((err as any).type === 'network' || (err as any).type === 'server-error') {
-        toast.error('Network error. Check your connection.');
+        toast.error('Network error. Check your connection.', { id: 'peer-error' });
         setConnectionStatus('idle');
       }
     });
@@ -355,10 +381,12 @@ export function useFileShare() {
 
   // ── Connect by Peer ID ────────────────────────────────────────────────────
   const connectToPeer = useCallback((targetId: string, nameHint?: string) => {
-    if (!peerRef.current) { toast.error('Still initializing…'); return; }
-    if (targetId === myId) { toast.error('Cannot connect to yourself.'); return; }
-    if (connectionRef.current?.open) { toast('Already connected.'); return; }
+    if (!peerRef.current) { toast.error('Still initializing…', { id: 'peer-error' }); return; }
+    if (targetId === myId) { toast.error('Cannot connect to yourself.', { id: 'peer-error' }); return; }
+    if (connectionRef.current?.open && connectedPeerId === targetId) { toast('Already connected.', { id: 'peer-status' }); return; }
+    if (connectingTargetRef.current === targetId && connectionStatus === 'connecting') return;
 
+    connectingTargetRef.current = targetId;
     setConnectionStatus('connecting');
     if (nameHint) setConnectedPeerName(nameHint);
 
@@ -366,15 +394,16 @@ export function useFileShare() {
       const conn = peerRef.current.connect(targetId);
       setupConnection(conn);
     } catch {
+      connectingTargetRef.current = null;
       setConnectionStatus('idle');
-      toast.error('Failed to initiate connection.');
+      toast.error('Failed to initiate connection.', { id: 'peer-error' });
     }
-  }, [myId, setupConnection]);
+  }, [myId, connectedPeerId, connectionStatus, setupConnection]);
 
   // ── Connect by 6-digit code ───────────────────────────────────────────────
   const connectByCode = useCallback(async (code: string) => {
     const clean = code.replace(/\s+/g, '').trim();
-    if (!clean) { toast.error('Please enter a code'); return; }
+    if (!clean) { toast.error('Please enter a code', { id: 'peer-error' }); return; }
 
     // Check local devices first
     const local = nearbyDevices.find(d => d.code?.replace(/\s+/g, '') === clean);
@@ -387,17 +416,22 @@ export function useFileShare() {
         connectToPeer(res.device.id, res.device.name);
       } else {
         setConnectionStatus('idle');
-        toast.error('No device found with that code.');
+        toast.error('No device found with that code.', { id: 'peer-error' });
       }
     } catch {
       setConnectionStatus('idle');
-      toast.error('Could not verify code.');
+      toast.error('Could not verify code.', { id: 'peer-error' });
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nearbyDevices, connectToPeer]);
 
   // ── Disconnect ────────────────────────────────────────────────────────────
   const disconnect = useCallback(() => {
+    if (connectionTimeoutRef.current) {
+      clearTimeout(connectionTimeoutRef.current);
+      connectionTimeoutRef.current = null;
+    }
+    connectingTargetRef.current = null;
     try { connectionRef.current?.close(); } catch {}
     connectionRef.current = null;
     setConnectedPeerId('');

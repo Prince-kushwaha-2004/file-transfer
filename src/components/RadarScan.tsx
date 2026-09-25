@@ -23,13 +23,23 @@ function DeviceIcon({ type, size = 18 }: { type?: string; size?: number }) {
 
 /* ── Camera QR Scanner ────────────────────────────────────────────────────── */
 function CameraScanner({ onScan, onClose }: { onScan: (text: string) => void; onClose: () => void }) {
-  const videoRef  = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const rafRef    = useRef<number>(0);
+  const videoRef      = useRef<HTMLVideoElement>(null);
+  const canvasRef     = useRef<HTMLCanvasElement>(null);
+  const streamRef     = useRef<MediaStream | null>(null);
+  const rafRef        = useRef<number>(0);
+  const hasScannedRef = useRef<boolean>(false);
   const [error, setError] = useState('');
 
+  const stopStream = useCallback(() => {
+    cancelAnimationFrame(rafRef.current);
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(t => t.stop());
+      streamRef.current = null;
+    }
+  }, []);
+
   const tick = useCallback(() => {
+    if (hasScannedRef.current) return;
     const video  = videoRef.current;
     const canvas = canvasRef.current;
     if (!video || !canvas || video.readyState !== video.HAVE_ENOUGH_DATA) {
@@ -43,11 +53,23 @@ function CameraScanner({ onScan, onClose }: { onScan: (text: string) => void; on
     ctx.drawImage(video, 0, 0);
     const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
     import('jsqr').then(({ default: jsQR }) => {
+      if (hasScannedRef.current) return;
       const code = jsQR(img.data, img.width, img.height);
-      if (code?.data) { onScan(code.data); return; }
-    }).catch(() => {});
-    rafRef.current = requestAnimationFrame(tick);
-  }, [onScan]);
+      if (code?.data) {
+        hasScannedRef.current = true;
+        stopStream();
+        onScan(code.data);
+        return;
+      }
+      if (!hasScannedRef.current) {
+        rafRef.current = requestAnimationFrame(tick);
+      }
+    }).catch(() => {
+      if (!hasScannedRef.current) {
+        rafRef.current = requestAnimationFrame(tick);
+      }
+    });
+  }, [onScan, stopStream]);
 
   useEffect(() => {
     navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } })
@@ -62,10 +84,9 @@ function CameraScanner({ onScan, onClose }: { onScan: (text: string) => void; on
       .catch(() => setError('Camera access denied. Allow camera permission and try again.'));
 
     return () => {
-      cancelAnimationFrame(rafRef.current);
-      streamRef.current?.getTracks().forEach(t => t.stop());
+      stopStream();
     };
-  }, [tick]);
+  }, [tick, stopStream]);
 
   return (
     <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
@@ -75,7 +96,7 @@ function CameraScanner({ onScan, onClose }: { onScan: (text: string) => void; on
             <Camera className="w-4 h-4 text-blue-400" />
             Scan QR Code
           </span>
-          <button onClick={onClose} className="text-zinc-400 hover:text-white"><X className="w-5 h-5" /></button>
+          <button onClick={() => { stopStream(); onClose(); }} className="text-zinc-400 hover:text-white"><X className="w-5 h-5" /></button>
         </div>
         <div className="relative bg-black">
           {error ? (
@@ -164,7 +185,14 @@ export function RadarScan({
   const [showMyCode, setShowMyCode] = useState(false);
   const [codeInput, setCod] = useState('');
   const [showCamera, setShowCamera] = useState(false);
+  const scanLockRef = useRef(false);
   const isConnecting = connectionStatus === 'connecting';
+
+  useEffect(() => {
+    if (connectionStatus === 'idle' || connectionStatus === 'disconnected') {
+      scanLockRef.current = false;
+    }
+  }, [connectionStatus]);
 
   const handleCodeSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -172,6 +200,8 @@ export function RadarScan({
   };
 
   const handleQrScan = (text: string) => {
+    if (scanLockRef.current || isConnecting) return;
+    scanLockRef.current = true;
     setShowCamera(false);
     try {
       const url = new URL(text);
